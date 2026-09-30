@@ -9,7 +9,8 @@ a sibling C++ executable loads the QML and captures a completed frame.
 Requires Linux/POSIX, Python 3.10+, a C++17 compiler, Make, pkg-config, and Qt 6
 development libraries for Core, Gui, Qml and Quick. Install the QML modules and
 fonts used by your fixtures separately. Tested here with Python 3.12.14,
-GCC 16.2.1, Make 4.4.1 and Qt 6.11.2; other versions have not been verified.
+GCC 16.2.1, Make 4.4.1 and Qt 6.11.2. Hosted CI also passed on Ubuntu 22.04
+(Python 3.10.12, Qt 6.2.4) and 24.04 (Python 3.12.3, Qt 6.4.2).
 
 From the project directory:
 
@@ -383,9 +384,10 @@ Playwright MCP, Chrome DevTools MCP and the official SDK. The comparison records
 the historical 0.2.0 baseline. 0.3.0 adds explicit geometry assertions, a bounded
 visual tree, strict diagnostics, version pairing and modern protocol.
 
-The prepared CI workflow builds and runs make check and hooks on Ubuntu 22.04/
-24.04 with distro Qt packages and Node 22. Hosted PASS requires an authorized
-push and an observed run. CI does not run a production shell or install OpenCode.
+CI builds and runs make check and hooks on Ubuntu 22.04/24.04 with distro Qt
+packages and Node 22. Both jobs passed for the published 0.3.0 implementation:
+[observed workflow run](https://github.com/PavelLizunov/qml-preview-mcp/actions/runs/36764944724).
+CI does not run a production shell or install OpenCode.
 
 ## Source provenance and license
 
