@@ -18,7 +18,9 @@ make
 make check
 ```
 
-The build uses `pkg-config --cflags --libs Qt6Quick`. Python has no package
+The build uses `pkg-config --cflags --libs Qt6Quick`. If the Qt distribution
+omits `.pc` files (Ubuntu 22.04), it queries header/library paths using `qmake6`.
+Python has no package
 dependencies. `make check` starts an owned stdio client, renders the bundled
 component through its consumer fixture, validates PNG pixels, and checks failures.
 `make check` runs both legacy smoke and 0.3 geometry/protocol checks. Its temporary
