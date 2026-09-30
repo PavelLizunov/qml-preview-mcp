@@ -12,14 +12,15 @@
 #include <QQmlEngine>
 #include <QQuickItem>
 #include <QQuickView>
-#include <QSet>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QTimer>
 #include <cmath>
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 
-static constexpr auto version = "0.2.0";
+static constexpr auto version = "0.3.0";
+static constexpr int metadataLimit = 512 * 1024;
 
 static void platform(int dpr) {
     qunsetenv("QML_IMPORT_PATH");
@@ -39,15 +40,93 @@ static void jsonOutput(const QJsonObject &object) {
     std::fflush(stdout);
 }
 
-static void boundedLog(QtMsgType type, const QMessageLogContext &, const QString &message) {
-    static std::atomic<int> remaining {65536};
-    const QByteArray bytes = message.left(16384).toUtf8() + '\n';
-    const int count = qBound(0, remaining.fetch_sub(bytes.size()), int(bytes.size()));
-    if (count > 0) {
-        std::fwrite(bytes.constData(), 1, count, stderr);
+static void boundedLog(QtMsgType type, const QMessageLogContext &context, const QString &message) {
+    static QMutex mutex;
+    QMutexLocker lock(&mutex);
+    static int remaining = 65536;
+    const char *level = type == QtDebugMsg ? "debug" : type == QtInfoMsg ? "info"
+        : type == QtWarningMsg ? "warning" : type == QtCriticalMsg ? "critical" : "fatal";
+    const QJsonObject record {{"level", level}, {"message", message.left(4096)},
+        {"source", context.file ? QJsonValue(QString::fromUtf8(context.file).left(1024)) : QJsonValue(QJsonValue::Null)},
+        {"line", context.line}, {"category", context.category ? QString::fromUtf8(context.category).left(128) : "qt"}};
+    const QByteArray bytes = QJsonDocument(record).toJson(QJsonDocument::Compact) + '\n';
+    const QByteArray dropped = "{\"level\":\"warning\",\"message\":\"Diagnostics truncated\",\"category\":\"limit\"}\n";
+    if (remaining >= bytes.size() + dropped.size()) {
+        std::fwrite(bytes.constData(), 1, bytes.size(), stderr);
+        remaining -= bytes.size();
+    } else if (remaining >= dropped.size()) {
+        std::fwrite(dropped.constData(), 1, dropped.size(), stderr);
+        remaining = 0;
     }
     if (type == QtFatalMsg)
         std::abort();
+}
+
+static QJsonObject geometry(QQuickItem *item) {
+    const QRectF bounds = item->mapRectToScene(QRectF(0, 0, item->width(), item->height()));
+    const QList<double> numbers {bounds.x(), bounds.y(), bounds.width(), bounds.height(),
+                                item->implicitWidth(), item->implicitHeight()};
+    for (double number : numbers) {
+        if (!std::isfinite(number))
+            return {};
+    }
+    return {{"x", bounds.x()}, {"y", bounds.y()}, {"width", bounds.width()}, {"height", bounds.height()},
+            {"implicitWidth", item->implicitWidth()}, {"implicitHeight", item->implicitHeight()},
+            {"visible", item->isVisible()}, {"enabled", item->isEnabled()}, {"clip", item->clip()},
+            {"activeFocus", item->hasActiveFocus()}, {"coordinateSpace", "logical-scene-axis-aligned"}};
+}
+
+// Traverse visual ownership, not QObject parentage; bounded admission prevents
+// snapshots or name lookup from expanding without a finite work budget.
+static bool visualItems(QQuickItem *root, QList<QQuickItem *> &items) {
+    items.append(root);
+    for (int i = 0; i < items.size(); ++i) {
+        const auto children = items[i]->childItems();
+        if (items.size() + children.size() > 10000)
+            return false;
+        items.append(children);
+    }
+    return true;
+}
+
+static QJsonObject snapshot(QQuickItem *root, const QJsonObject &options) {
+    const int maxDepth = options.value("maxDepth").toInt(6);
+    const int maxItems = options.value("maxItems").toInt(64);
+    QJsonArray nodes;
+    struct Entry { QQuickItem *item; int depth; int parent; };
+    QList<Entry> pending {{root, 0, -1}};
+    bool truncated = false;
+    while (!pending.isEmpty() && nodes.size() < maxItems) {
+        const Entry entry = pending.takeLast();
+        auto node = geometry(entry.item);
+        node.insert("geometryValid", !node.isEmpty());
+        node.insert("index", nodes.size());
+        node.insert("parent", entry.parent < 0 ? QJsonValue(QJsonValue::Null) : QJsonValue(entry.parent));
+        node.insert("depth", entry.depth);
+        node.insert("type", QString::fromUtf8(entry.item->metaObject()->className()).left(128));
+        node.insert("objectName", entry.item->objectName().left(128));
+        const QVariant text = entry.item->property("text");
+        if (text.metaType().id() == QMetaType::QString) {
+            node.insert("text", text.toString().left(256));
+            node.insert("textTruncated", text.toString().size() > 256);
+        }
+        const int parentIndex = nodes.size();
+        nodes.append(node);
+        const auto children = entry.item->childItems();
+        if (entry.depth >= maxDepth) {
+            truncated = truncated || !children.isEmpty();
+            continue;
+        }
+        // Add only nodes that could fit; report omitted siblings explicitly.
+        const int budget = maxItems - nodes.size() - pending.size();
+        const int count = qMax(0, qMin(budget, int(children.size())));
+        truncated = truncated || count < children.size();
+        for (int i = count - 1; i >= 0; --i)
+            pending.append({children[i], entry.depth + 1, parentIndex});
+    }
+    return {{"nodes", nodes}, {"truncated", truncated || !pending.isEmpty()},
+            {"maxItems", maxItems}, {"maxDepth", maxDepth}, {"kind", "QQuickItem-visual-tree"},
+            {"accessibilityVerified", false}};
 }
 
 static bool integer(const QJsonValue &value, int low, int high) {
@@ -94,6 +173,10 @@ int main(int argc, char **argv) {
         return 1;
     }
     const QJsonObject config = document.object();
+    if (config.value("expectedVersion").toString() != version) {
+        std::fprintf(stderr, "Renderer/wrapper version mismatch\n");
+        return 1;
+    }
     const QString qmlPath = config.value("qmlPath").toString();
     const QString readyName = config.value("readyProperty").toString();
     if (!QFileInfo(qmlPath).isAbsolute() || !QFileInfo(qmlPath).isFile()
@@ -103,7 +186,12 @@ int main(int argc, char **argv) {
         || (config.contains("initialProperties") && (!config.value("initialProperties").isObject()
             || config.value("initialProperties").toObject().size() > 64))
         || (config.contains("measureObjects") && (!config.value("measureObjects").isArray()
-            || config.value("measureObjects").toArray().size() > 64))
+            || config.value("measureObjects").toArray().size() > 128))
+        || (!config.value("snapshot").isNull() && (!config.value("snapshot").isObject()
+            || !integer(config.value("snapshot").toObject().value("maxDepth").isUndefined()
+                ? QJsonValue(6) : config.value("snapshot").toObject().value("maxDepth"), 0, 16)
+            || !integer(config.value("snapshot").toObject().value("maxItems").isUndefined()
+                ? QJsonValue(64) : config.value("snapshot").toObject().value("maxItems"), 1, 256)))
         || (config.contains("readyProperty") && (!config.value("readyProperty").isString()
             || readyName.isEmpty() || readyName.size() > 128))) {
         std::fprintf(stderr, "Invalid renderer paths, geometry, imports or readiness property\n");
@@ -207,7 +295,11 @@ int main(int argc, char **argv) {
         capturing = true;
         QJsonObject measurements;
         const auto requested = config.value("measureObjects").toArray();
-        const auto descendants = view.rootObject()->findChildren<QObject *>();
+        QList<QQuickItem *> descendants;
+        if (!requested.isEmpty() && !visualItems(view.rootObject(), descendants)) {
+            fail("Visual tree exceeds 10000-item measurement limit");
+            return;
+        }
         for (const auto &value : requested) {
             if (!value.isString() || value.toString().isEmpty() || value.toString().size() > 128) {
                 fail("Invalid measurement objectName");
@@ -215,33 +307,23 @@ int main(int argc, char **argv) {
             }
             const QString name = value.toString();
             QList<QObject *> matches;
-            if (view.rootObject()->objectName() == name)
-                matches.append(view.rootObject());
             for (auto *object : descendants) {
                 if (object->objectName() == name)
                     matches.append(object);
             }
             if (matches.size() != 1 || !qobject_cast<QQuickItem *>(matches.value(0))) {
+                if (!config.value("requiredMeasureObjects").toArray().contains(name))
+                    continue; // Missing/ambiguous assertion targets become explicit FAIL results.
                 fail("Measurement requires exactly one visual QQuickItem named: " + name);
                 return;
             }
             auto *item = qobject_cast<QQuickItem *>(matches[0]);
-            const QRectF bounds = item->mapRectToScene(QRectF(0, 0, item->width(), item->height()));
-            const QList<double> geometry {bounds.x(), bounds.y(), bounds.width(), bounds.height(),
-                                          item->implicitWidth(), item->implicitHeight()};
-            for (double number : geometry) {
-                if (!std::isfinite(number)) {
-                    fail("Measurement geometry must be finite: " + name);
-                    return;
-                }
+            const auto measured = geometry(item);
+            if (measured.isEmpty()) {
+                fail("Measurement geometry must be finite: " + name);
+                return;
             }
-            measurements.insert(name, QJsonObject {
-                {"x", bounds.x()}, {"y", bounds.y()}, {"width", bounds.width()}, {"height", bounds.height()},
-                {"implicitWidth", item->implicitWidth()}, {"implicitHeight", item->implicitHeight()},
-                {"visible", item->isVisible()}, {"enabled", item->isEnabled()},
-                {"clip", item->clip()}, {"activeFocus", item->hasActiveFocus()},
-                {"coordinateSpace", "logical-scene-axis-aligned"}
-            });
+            measurements.insert(name, measured);
         }
         // The queued callback runs on the GUI thread after a completed frame.
         const QImage image = view.grabWindow();
@@ -262,7 +344,7 @@ int main(int argc, char **argv) {
             fail("PNG decode verification failed or output exceeds 64 MiB");
             return;
         }
-        const QJsonObject metadata {
+        QJsonObject metadata {
             {"pixelWidth", decoded.width()}, {"pixelHeight", decoded.height()},
             {"dpr", view.effectiveDevicePixelRatio()}, {"backend", "software"},
             {"platform", QGuiApplication::platformName()}, {"qtVersion", qVersion()},
@@ -274,6 +356,12 @@ int main(int argc, char **argv) {
             {"readiness", readyName.isEmpty() ? "loaded-frame" : "property-and-frame"},
             {"capturedAt", QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)}
         };
+        if (config.value("snapshot").isObject())
+            metadata.insert("snapshot", snapshot(view.rootObject(), config.value("snapshot").toObject()));
+        if (QJsonDocument(metadata).toJson(QJsonDocument::Compact).size() > metadataLimit) {
+            fail("Renderer metadata exceeds 512 KiB limit");
+            return;
+        }
         jsonOutput(metadata);
         app.quit();
     }, Qt::QueuedConnection);

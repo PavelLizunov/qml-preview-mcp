@@ -11,6 +11,7 @@ qml-render: qml-render.cpp
 
 check: qml-render
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/smoke.py
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/v03.py
 
 clean:
 	rm -f qml-render

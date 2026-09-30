@@ -61,6 +61,9 @@ def main():
                             "importPaths": [str(ROOT / "tests" / "imports")], "readyProperty": "previewReady",
                             "imageMode": "image", "locale": "en_US", "measureObjects": ["panel"],
                             "dependencyPaths": [str(project / "FixturePanel.qml")],
+                            "warningsPolicy": "error", "snapshot": {"maxItems": 32},
+                            "geometryChecks": [{"kind": "size", "a": "panel", "field": "width", "value": 440},
+                                               {"kind": "inside", "a": "panel", "container": "consumer"}],
                         }
                     elif step == 3:
                         name, args = tool("render_qml"), {
@@ -144,7 +147,7 @@ def main():
         assert "Plugin visual acceptance" in all_messages, "System hook did not reach actual client"
         assert "Plugin visual checkpoint" in all_messages, "Edit reminder did not reach actual client"
         assert "existing .qml file" in all_messages, "Tool error did not reach actual client"
-        assert any("rendererVersion" in str(message.get("content")) and "0.2.0" in str(message.get("content"))
+        assert any("rendererVersion" in str(message.get("content")) and "0.3.0" in str(message.get("content"))
                    for request in requests for message in request["messages"])
         assert "data:image/png;base64," in all_messages, "PNG attachment did not reach image-capable provider input"
         png = (evidence / "client.png").read_bytes()

@@ -5,6 +5,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -17,14 +18,40 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 PROTOCOLS = ("2024-11-05", "2025-06-18", "2025-11-25")
+MODERN_PROTOCOL = "2026-07-28"
 RENDERER = Path(__file__).resolve().with_name("qml-render")
 MAX_MESSAGE = 1024 * 1024
 MAX_PNG = 64 * 1024 * 1024
 MAX_IMAGE = 4 * 1024 * 1024
 MAX_SOURCE = 16 * 1024 * 1024
+MAX_METADATA = 512 * 1024
 SEND_LOCK = threading.Lock()
+NAME_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 128}
+NUMBER_SCHEMA = {"type": "number", "minimum": -1000000, "maximum": 1000000}
+CHECK_FIELDS = {
+    "align": ("a", "b", "field"), "equal": ("a", "b", "field"),
+    "centered": ("a", "container", "axis"), "symmetric": ("a", "b", "container", "axis"),
+    "inside": ("a", "container"), "noOverlap": ("a", "b"),
+    "size": ("a", "field", "value"), "gap": ("a", "b", "axis", "value"),
+}
+
+
+def check_schema(kind, fields):
+    properties = {"kind": {"const": kind}, "id": NAME_SCHEMA,
+                  "tolerance": {"type": "number", "minimum": 0, "maximum": 1000, "default": 1}}
+    for name in fields:
+        if name == "field":
+            choices = ["width", "height"] if kind in ("equal", "size") else ["left", "right", "top", "bottom", "centerX", "centerY"]
+            properties[name] = {"type": "string", "enum": choices}
+        elif name == "axis":
+            properties[name] = {"type": "string", "enum": ["x", "y"]}
+        else:
+            properties[name] = NUMBER_SCHEMA if name == "value" else NAME_SCHEMA
+    return {"type": "object", "properties": properties, "required": ["kind", *fields], "additionalProperties": False}
+
+
 SCHEMA = {
     "type": "object",
     "properties": {
@@ -56,6 +83,16 @@ SCHEMA = {
         "dependencyPaths": {"type": "array", "default": [], "maxItems": 128, "uniqueItems": True,
                             "items": {"type": "string", "minLength": 1, "maxLength": 4096},
                             "description": "Explicit reviewed files (QML, models, catalogs, assets) hashed before and after rendering; maximum 16 MiB per file."},
+        "geometryChecks": {"type": "array", "default": [], "maxItems": 64,
+                           "items": {"oneOf": [check_schema(k, f) for k, f in CHECK_FIELDS.items()]},
+                           "description": "Explicit logical-scene layout rules; default tolerance 1. Failed rules retain PNG with isError=true."},
+        "snapshot": {"type": "object", "default": {}, "properties": {
+            "maxDepth": {"type": "integer", "minimum": 0, "maximum": 16, "default": 6},
+            "maxItems": {"type": "integer", "minimum": 1, "maximum": 256, "default": 64}},
+            "additionalProperties": False,
+            "description": "Opt-in visual-tree snapshot; omit for no snapshot, {} enables bounded defaults. Not an accessibility consumer test."},
+        "warningsPolicy": {"type": "string", "enum": ["report", "error"], "default": "report",
+                           "description": "error marks warning/critical diagnostics as acceptance errors while retaining the verified PNG."},
     },
     "required": ["qmlPath", "outputPath"],
     "additionalProperties": False,
@@ -68,6 +105,91 @@ class InvalidParams(ValueError):
 
 class Cancelled(RuntimeError):
     pass
+
+
+class ToolFailure(RuntimeError):
+    def __init__(self, code, message, hint):
+        super().__init__(message)
+        self.code, self.hint = code, hint
+
+
+def validate_checks(checks):
+    if not isinstance(checks, list) or len(checks) > 64:
+        raise InvalidParams("geometryChecks must be an array of at most 64 rules")
+    for rule in checks:
+        if not isinstance(rule, dict) or not isinstance(rule.get("kind"), str) or rule["kind"] not in CHECK_FIELDS:
+            raise InvalidParams("Unknown geometry rule")
+        spec = check_schema(rule["kind"], CHECK_FIELDS[rule["kind"]])
+        if set(rule) - spec["properties"].keys() or any(key not in rule for key in spec["required"]):
+            raise InvalidParams("Missing/unknown geometry rule fields")
+        for name, value in rule.items():
+            field = spec["properties"][name]
+            if field.get("type") == "number":
+                if type(value) not in (int, float) or not math.isfinite(value) or not field["minimum"] <= value <= field["maximum"]:
+                    raise InvalidParams(f"Invalid geometry number: {name}")
+            elif not valid_string(value, 1, 128) or "enum" in field and value not in field["enum"]:
+                raise InvalidParams(f"Invalid geometry field: {name}")
+        if rule["kind"] == "size" and rule["value"] < 0:
+            raise InvalidParams("Expected size must be nonnegative")
+    return checks
+
+
+def geometry_results(checks, measurements):
+    results = []
+    def edge(item, field):
+        return {"left": item["x"], "right": item["x"] + item["width"],
+                "top": item["y"], "bottom": item["y"] + item["height"],
+                "centerX": item["x"] + item["width"] / 2,
+                "centerY": item["y"] + item["height"] / 2,
+                "width": item["width"], "height": item["height"]}[field]
+    for index, rule in enumerate(checks):
+        tolerance = rule.get("tolerance", 1)
+        names = [rule[key] for key in ("a", "b", "container") if key in rule]
+        missing = [name for name in names if name not in measurements]
+        result = {"id": rule.get("id", str(index)), "kind": rule["kind"], "tolerance": tolerance}
+        if missing:
+            results.append({**result, "status": "FAIL", "expected": "unique visual objects", "measured": {"missing": missing}})
+            continue
+        a = measurements[rule["a"]]
+        b = measurements.get(rule.get("b"))
+        c = measurements.get(rule.get("container"))
+        if any(not measurements[name]["visible"] or measurements[name]["width"] <= 0 or measurements[name]["height"] <= 0 for name in names):
+            results.append({**result, "status": "FAIL", "expected": "visible positive-area objects", "measured": names})
+            continue
+        kind = rule["kind"]
+        if kind in ("align", "equal"):
+            expected, measured = edge(b, rule["field"]), edge(a, rule["field"])
+            delta = abs(measured - expected)
+        elif kind == "size":
+            expected, measured = rule["value"], edge(a, rule["field"])
+            delta = abs(measured - expected)
+        elif kind == "centered":
+            field = "centerX" if rule["axis"] == "x" else "centerY"
+            expected, measured = edge(c, field), edge(a, field)
+            delta = abs(measured - expected)
+        elif kind == "symmetric":
+            axis = rule["axis"]
+            field, cross, dimension, other = ("centerX", "centerY", "width", "height") if axis == "x" else ("centerY", "centerX", "height", "width")
+            expected = [2 * edge(c, field), edge(a, cross), a[dimension], a[other]]
+            measured = [edge(a, field) + edge(b, field), edge(b, cross), b[dimension], b[other]]
+            delta = max(abs(x - y) for x, y in zip(expected, measured))
+        elif kind == "inside":
+            expected = "all bounds inside container"
+            measured = {"left": edge(c, "left") - edge(a, "left"), "right": edge(a, "right") - edge(c, "right"),
+                        "top": edge(c, "top") - edge(a, "top"), "bottom": edge(a, "bottom") - edge(c, "bottom")}
+            delta = max(0, *measured.values())
+        elif kind == "noOverlap":
+            expected = "intersection penetration <= tolerance"
+            measured = {"x": max(0, min(edge(a, "right"), edge(b, "right")) - max(a["x"], b["x"])),
+                        "y": max(0, min(edge(a, "bottom"), edge(b, "bottom")) - max(a["y"], b["y"]))}
+            delta = min(measured.values())
+        else:  # directed gap, a precedes b
+            expected = rule["value"]
+            measured = b[rule["axis"]] - edge(a, "right" if rule["axis"] == "x" else "bottom")
+            delta = abs(measured - expected)
+        results.append({**result, "status": "PASS" if delta <= tolerance else "FAIL", "expected": expected,
+                        "measured": measured, "deviation": delta, "coordinateSpace": "logical-scene-axis-aligned"})
+    return results
 
 
 def valid_string(value, low=1, high=4096):
@@ -91,6 +213,17 @@ def validate(args):
             if "default" not in spec:
                 continue
         value = args.get(name, spec.get("default"))
+        if name == "geometryChecks":
+            result[name] = validate_checks(value)
+            continue
+        if name == "snapshot":
+            if not isinstance(value, dict) or set(value) - {"maxDepth", "maxItems"}:
+                raise InvalidParams("snapshot accepts only maxDepth and maxItems")
+            for key, limit in (("maxDepth", 16), ("maxItems", 256)):
+                if key in value and (type(value[key]) is not int or not (0 if key == "maxDepth" else 1) <= value[key] <= limit):
+                    raise InvalidParams(f"Invalid snapshot {key}")
+            result[name] = value if name in args else None
+            continue
         if spec["type"] == "integer":
             if type(value) is not int or not spec.get("minimum", 1) <= value <= spec.get("maximum", 2):
                 raise InvalidParams(f"Invalid integer: {name}")
@@ -130,6 +263,11 @@ def validate(args):
     for path in result["importPaths"] + result["dependencyPaths"]:
         if not Path(path).is_absolute() or ".." in Path(path).parts:
             raise InvalidParams("Import/dependency paths must be absolute without '..'")
+    names = set(result["measureObjects"])
+    for rule in result["geometryChecks"]:
+        names.update(rule[k] for k in ("a", "b", "container") if k in rule)
+    if len(names) > 128:
+        raise InvalidParams("Measurements and checks reference more than 128 objects")
     return result
 
 
@@ -196,8 +334,8 @@ def run_renderer(command, args, cancelled, timeout, image=None):
                     raise Cancelled("Render cancelled")
                 if time.monotonic() >= deadline:
                     raise TimeoutError("Renderer exceeded its process deadline")
-                if os.fstat(stdout.fileno()).st_size > 65536 or os.fstat(stderr.fileno()).st_size > 65536:
-                    raise RuntimeError("Renderer diagnostics/metadata exceed 64 KiB")
+                if os.fstat(stdout.fileno()).st_size > MAX_METADATA or os.fstat(stderr.fileno()).st_size > 65536:
+                    raise RuntimeError("Renderer diagnostics/metadata exceed limits")
                 if image is not None and os.fstat(image.fileno()).st_size > MAX_PNG:
                     raise RuntimeError("Renderer PNG exceeds 64 MiB")
                 try:
@@ -214,19 +352,21 @@ def run_renderer(command, args, cancelled, timeout, image=None):
         stderr.seek(0)
         diagnostics = stderr.read(65537).decode("utf-8", errors="replace")
         stdout.seek(0)
-        raw = stdout.read(65537)
-        if len(raw) > 65536 or len(diagnostics.encode("utf-8")) > 65536:
-            raise RuntimeError("Renderer metadata/diagnostics exceed 64 KiB")
+        raw = stdout.read(MAX_METADATA + 1)
+        if len(raw) > MAX_METADATA or len(diagnostics.encode("utf-8")) > 65536:
+            raise RuntimeError("Renderer metadata/diagnostics exceed limits")
         if process.returncode:
             raise RuntimeError(f"Renderer exited {process.returncode}: {diagnostics.strip()}")
         metadata = json.loads(raw)
         if not isinstance(metadata, dict):
             raise RuntimeError("Renderer metadata must be an object")
+        if metadata.get("rendererVersion") != VERSION:
+            raise ToolFailure("VERSION_MISMATCH", "Renderer/wrapper version mismatch", "Run make with the current sources beside the wrapper")
         return metadata, diagnostics.strip()
 
 
-def healthcheck(cancelled):
-    metadata, diagnostics = run_renderer([str(RENDERER), "--healthcheck"], None, cancelled, 3)
+def healthcheck(cancelled, timeout=3):
+    metadata, diagnostics = run_renderer([str(RENDERER), "--healthcheck"], None, cancelled, timeout)
     if metadata.get("backend") != "software" or metadata.get("platform") != "offscreen":
         raise RuntimeError("Renderer healthcheck returned an unsupported backend/platform")
     metadata.update({"toolVersion": VERSION, "pythonVersion": sys.version.split()[0],
@@ -237,6 +377,7 @@ def healthcheck(cancelled):
 
 
 def render(args, cancelled, publication_lock):
+    deadline = time.monotonic() + args["timeoutMs"] / 1000 + 2
     qml = Path(args["qmlPath"])
     if qml.suffix.lower() != ".qml" or not qml.is_file():
         raise ValueError("qmlPath must be an existing .qml file")
@@ -244,15 +385,29 @@ def render(args, cancelled, publication_lock):
     dependencies = {str(Path(p).resolve(strict=True)) for p in args["dependencyPaths"]}
     dependencies.add(args["qmlPath"])
     hashes = {p: file_hash(p) for p in sorted(dependencies)}
+    # Refuse a stale binary before executing any owning QML. Hashes also cover
+    # changes during preflight, which is part of this invocation's snapshot.
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or cancelled.is_set():
+        raise TimeoutError("Preflight exceeded its process deadline or call was cancelled")
+    healthcheck(cancelled, min(3, remaining))
     args["importPaths"] = [str(Path(p).resolve(strict=True)) for p in args["importPaths"]]
     if any(not Path(p).is_dir() for p in args["importPaths"]):
         raise ValueError("Each import path must be a directory")
     parent, name = destination(args["outputPath"])
     try:
         with tempfile.TemporaryFile() as image:
+            renderer_args = dict(args)
+            renderer_args["measureObjects"] = sorted(set(args["measureObjects"]) | {
+                rule[key] for rule in args["geometryChecks"] for key in ("a", "b", "container") if key in rule})
+            renderer_args["requiredMeasureObjects"] = args["measureObjects"]
+            renderer_args["expectedVersion"] = VERSION
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Preflight exceeded its process deadline")
             metadata, diagnostics = run_renderer(
-                [str(RENDERER), "--output-fd", str(image.fileno())], args,
-                cancelled, args["timeoutMs"] / 1000 + 2, image,
+                [str(RENDERER), "--output-fd", str(image.fileno())], renderer_args,
+                cancelled, remaining, image,
             )
             image.seek(0)
             data = image.read(MAX_PNG + 1)
@@ -279,6 +434,27 @@ def render(args, cancelled, publication_lock):
             "toolVersion": VERSION, "pythonVersion": sys.version.split()[0],
             "diagnostics": diagnostics.strip(),
         })
+        records = []
+        for line in diagnostics.splitlines():
+            try:
+                record = json.loads(line)
+                if not isinstance(record, dict) or "level" not in record:
+                    raise ValueError("Invalid diagnostic")
+            except ValueError:
+                record = {"level": "warning", "message": line, "source": None, "line": None, "category": "unstructured"}
+            records.append(record)
+        metadata["diagnosticRecords"] = records
+        checks = geometry_results(args["geometryChecks"], metadata.get("measurements", {}))
+        metadata["geometryResults"] = checks
+        failures = []
+        if any(check["status"] == "FAIL" for check in checks):
+            failures.append({"code": "GEOMETRY_FAILED", "message": "One or more explicit geometry rules failed",
+                             "hint": "Inspect the retained PNG and measured/expected values; correct the owning layout or its declared contract"})
+        if args["warningsPolicy"] == "error" and any(r["level"] in ("warning", "critical", "fatal") for r in records):
+            failures.append({"code": "DIAGNOSTICS_FAILED", "message": "Strict warning policy rejected Qt/QML diagnostics",
+                             "hint": "Inspect diagnosticRecords and fix the source; report policy is an explicit opt-out"})
+        metadata["acceptance"] = "FAIL" if failures else "PASS"
+        metadata["acceptanceErrors"] = failures
         with publication_lock:
             if cancelled.is_set():
                 raise Cancelled("Render cancelled before publication")
@@ -294,8 +470,38 @@ def send(message):
         sys.stdout.flush()
 
 
-def error(request_id, code, message):
-    send({"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}})
+def error(request_id, code, message, data=None):
+    details = {"code": code, "message": message}
+    if data is not None:
+        details["data"] = data
+    send({"jsonrpc": "2.0", "id": request_id, "error": details})
+
+
+def complete(result, protocol):
+    if protocol == MODERN_PROTOCOL:
+        return {**result, "resultType": "complete", "_meta": {
+            "io.modelcontextprotocol/serverInfo": {"name": "qml-preview", "version": VERSION}}}
+    return result
+
+
+def failure_result(exc, protocol):
+    if isinstance(exc, ToolFailure):
+        code, hint = exc.code, exc.hint
+    elif isinstance(exc, TimeoutError):
+        code, hint = "TIMEOUT", "Check the fixture's readiness condition and bounded startup operations"
+    elif isinstance(exc, FileExistsError):
+        code, hint = "OUTPUT_EXISTS", "Choose a new output filename; originals are never overwritten"
+    elif isinstance(exc, OSError):
+        code, hint = "FILESYSTEM_ERROR", "Check renderer/files, permissions and explicit paths; output ancestors cannot be symlinks"
+    elif isinstance(exc, ValueError):
+        code, hint = "INPUT_ERROR", "Check the documented tool arguments, existing QML/dependencies and image mode"
+    else:
+        code, hint = "RENDER_ERROR", "Inspect diagnostics and the reviewed QML/imports; rebuild the renderer if needed"
+    metadata = {"error": {"code": code, "message": str(exc), "hint": hint}}
+    result = {"content": [{"type": "text", "text": json.dumps(metadata)}], "isError": True}
+    if protocol != "2024-11-05":
+        result["structuredContent"] = metadata
+    return result
 
 
 class Server:
@@ -312,28 +518,28 @@ class Server:
                 cancelled.set()
         self.executor.shutdown(wait=True)
 
-    def execute(self, request_id, name, args, cancelled):
+    def execute(self, request_id, name, args, cancelled, protocol):
         try:
             if cancelled.is_set():
                 raise Cancelled("Call cancelled before execution")
             metadata, image = healthcheck(cancelled) if name == "healthcheck" else render(args, cancelled, self.lock)
-            result = {"content": [{"type": "text", "text": json.dumps(metadata)}], "isError": False}
+            result = {"content": [{"type": "text", "text": json.dumps(metadata)}], "isError": metadata.get("acceptance") == "FAIL"}
             if image is not None:
                 result["content"].append({"type": "image", "mimeType": "image/png",
                                           "data": base64.b64encode(image).decode("ascii")})
-            if self.protocol != "2024-11-05":
+            if protocol != "2024-11-05":
                 result["structuredContent"] = metadata
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-            result = {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+            result = failure_result(exc, protocol)
         except Exception as exc:
-            result = {"content": [{"type": "text", "text": f"Internal tool error: {type(exc).__name__}"}], "isError": True}
+            result = failure_result(RuntimeError(f"Internal tool error: {type(exc).__name__}"), protocol)
         finally:
             with self.lock:
                 self.calls.pop(request_id, None)
         # MCP cancellation requires no result; cancellation after publication may
         # race with completion, which clients must handle as already completed.
         if not cancelled.is_set():
-            send({"jsonrpc": "2.0", "id": request_id, "result": result})
+            send({"jsonrpc": "2.0", "id": request_id, "result": complete(result, protocol)})
 
     def handle(self, message):
         if (not isinstance(message, dict) or message.get("jsonrpc") != "2.0"
@@ -359,7 +565,35 @@ class Server:
         try:
             if not isinstance(params, dict):
                 raise InvalidParams("params must be an object")
-            if method == "initialize":
+            with self.lock:
+                if request_id in self.calls:
+                    raise InvalidParams("Duplicate in-flight request id")
+            meta = params.get("_meta", {})
+            modern = isinstance(meta, dict) and any(key in meta for key in (
+                "io.modelcontextprotocol/protocolVersion", "io.modelcontextprotocol/clientCapabilities", "io.modelcontextprotocol/clientInfo"))
+            protocol = self.protocol
+            if modern or method == "server/discover":
+                if not isinstance(meta, dict) or not valid_string(meta.get("io.modelcontextprotocol/protocolVersion"), 1, 32) or not isinstance(meta.get("io.modelcontextprotocol/clientCapabilities"), dict):
+                    raise InvalidParams("Modern requests require protocolVersion and clientCapabilities in params._meta")
+                requested = meta["io.modelcontextprotocol/protocolVersion"]
+                if requested != MODERN_PROTOCOL:
+                    error(request_id, -32022, "Unsupported protocol version", {
+                        "supported": [MODERN_PROTOCOL, *reversed(PROTOCOLS)], "requested": requested})
+                    return
+                info = meta.get("io.modelcontextprotocol/clientInfo")
+                if info is not None and (not isinstance(info, dict) or not valid_string(info.get("name"), 1, 256) or not valid_string(info.get("version"), 1, 256)):
+                    raise InvalidParams("Invalid modern clientInfo")
+                protocol = MODERN_PROTOCOL
+            elif "_meta" in params and not isinstance(meta, dict):
+                raise InvalidParams("_meta must be an object")
+            params = {key: value for key, value in params.items() if key != "_meta"}
+            if method == "server/discover":
+                if params:
+                    raise InvalidParams("server/discover takes only _meta")
+                result = {"supportedVersions": [MODERN_PROTOCOL, *reversed(PROTOCOLS)], "capabilities": {"tools": {}},
+                          "ttlMs": 0, "cacheScope": "private",
+                          "instructions": "Render reviewed inert QML consumers, inspect PNGs, check native design/anti-slop and rerender corrections. Geometry PASS is not design acceptance."}
+            elif method == "initialize" and protocol != MODERN_PROTOCOL:
                 if self.protocol:
                     raise InvalidParams("Server already initialized")
                 if (not isinstance(params.get("protocolVersion"), str)
@@ -374,10 +608,13 @@ class Server:
                           "serverInfo": {"name": "qml-preview", "version": VERSION},
                           "instructions": "For plugin UI changes: healthcheck, render the reviewed actual consumer with inert models, inspect its PNG in an image-capable host, review native design and anti-slop, fix authorized findings and rerender. Missing capabilities are blockers, not visual PASS. No desktop access or external viewers for development previews."}
             elif method == "ping":
+                if protocol == MODERN_PROTOCOL:
+                    error(request_id, -32601, "ping is not supported by modern MCP")
+                    return
                 if params:
                     raise InvalidParams("ping takes no parameters")
                 result = {}
-            elif not self.initialized:
+            elif protocol != MODERN_PROTOCOL and not self.initialized:
                 raise InvalidParams("Complete initialize and notifications/initialized first")
             elif method == "tools/list":
                 if params:
@@ -386,17 +623,29 @@ class Server:
                     {"name": "healthcheck", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
                      "description": "Preflight the offscreen Qt renderer, versions, imports and limits without executing project QML."},
                     {"name": "render_qml", "inputSchema": SCHEMA,
-                     "description": "Render the reviewed actual QML consumer after each meaningful plugin UI change and before delivery. Returns a PNG attachment by default plus geometry, hashes and diagnostics. Inspect the image, perform native design/anti-slop review, fix and rerender. NOT a sandbox; use inert models and explicit imports."}]}
+                      "description": "Render the reviewed actual QML consumer after each meaningful plugin UI change and before delivery. Returns a PNG attachment by default plus geometry, hashes and diagnostics. Inspect the image, perform native design/anti-slop review, fix and rerender. NOT a sandbox; use inert models and explicit imports."}]}
+                if protocol == MODERN_PROTOCOL:
+                    result.update({"ttlMs": 0, "cacheScope": "private"})
             elif method == "tools/call":
+                if set(params) - {"name", "arguments"}:
+                    raise InvalidParams("tools/call accepts only name, arguments and _meta")
                 name = params.get("name")
                 if name not in ("render_qml", "healthcheck"):
                     raise InvalidParams("Unknown tool")
                 args = params.get("arguments", {})
+                if protocol == MODERN_PROTOCOL and not isinstance(args, dict):
+                    raise InvalidParams("tools/call arguments must be an object")
                 if name == "healthcheck":
                     if not isinstance(args, dict) or args:
                         raise InvalidParams("healthcheck takes no arguments")
                 else:
-                    args = validate(args)
+                    try:
+                        args = validate(args)
+                    except InvalidParams as exc:
+                        if protocol != MODERN_PROTOCOL:
+                            raise
+                        send({"jsonrpc": "2.0", "id": request_id, "result": complete(failure_result(exc, protocol), protocol)})
+                        return
                 with self.lock:
                     if request_id in self.calls:
                         raise InvalidParams("Duplicate in-flight request id")
@@ -404,12 +653,12 @@ class Server:
                         raise InvalidParams("At most 8 in-flight/queued calls are allowed")
                     cancelled = threading.Event()
                     self.calls[request_id] = cancelled
-                self.executor.submit(self.execute, request_id, name, args, cancelled)
+                self.executor.submit(self.execute, request_id, name, args, cancelled, protocol)
                 return
             else:
                 error(request_id, -32601, f"Method not found: {method}")
                 return
-            send({"jsonrpc": "2.0", "id": request_id, "result": result})
+            send({"jsonrpc": "2.0", "id": request_id, "result": complete(result, protocol)})
         except InvalidParams as exc:
             error(request_id, -32602, str(exc))
         except Exception as exc:
@@ -438,7 +687,7 @@ def main():
             if not line.strip():
                 continue
             try:
-                message = json.loads(line, parse_constant=reject_constant)
+                message = json.loads(line.decode("utf-8"), parse_constant=reject_constant)
             except (ValueError, UnicodeError, RecursionError):
                 error(None, -32700, "Invalid JSON")
                 continue

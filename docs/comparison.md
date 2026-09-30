@@ -57,6 +57,13 @@ fixture tests. An offscreen scene has no verified compositor position.
 
 ## Confirmed gaps and practical follow-ups
 
+The findings below describe the pinned 0.2.0 baseline. Local 0.3.0 development
+adds explicit layout assertions, visual-tree lookup/snapshots, strict warning
+policy, machine-readable errors, version pairing and dual-era 2026-07-28 support.
+CI is prepared for Ubuntu 22.04/24.04; hosted results require a published run.
+Automatic painted-pixel clipping/occlusion and model compliance remain outside
+those features. The protocol implementation still has no external runtime SDK.
+
 1. **Protocol coverage is deliberately older than the newest specification.**
    Version 0.2.0 supports 2024-11-05, 2025-06-18 and 2025-11-25. The official
    [2026-07-28 specification](https://modelcontextprotocol.io/specification/2026-07-28)

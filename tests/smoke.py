@@ -37,6 +37,7 @@ class Client:
         self.selector = selectors.DefaultSelector()
         self.selector.register(self.process.stdout, selectors.EVENT_READ)
         self.request_id = 0
+        self.buffer = bytearray()
         result = self.request("initialize", {
             "protocolVersion": protocol, "capabilities": {},
             "clientInfo": {"name": "qml-preview-smoke", "version": "1"},
@@ -49,9 +50,13 @@ class Client:
         self.process.stdin.flush()
 
     def read(self):
-        assert self.selector.select(timeout=15), "MCP response timed out"
-        line = self.process.stdout.readline()
-        assert line, "MCP closed stdout unexpectedly"
+        while b"\n" not in self.buffer:
+            assert self.selector.select(timeout=15), "MCP response timed out"
+            data = os.read(self.process.stdout.fileno(), 65536)
+            assert data, "MCP closed stdout unexpectedly"
+            self.buffer.extend(data)
+        line, _, rest = self.buffer.partition(b"\n")
+        self.buffer = bytearray(rest)
         return json.loads(line)
 
     def request(self, method, params=None):
@@ -175,13 +180,13 @@ def main():
             assert {tool["name"] for tool in listing} == {"healthcheck", "render_qml"}
             schema = next(tool["inputSchema"] for tool in listing if tool["name"] == "render_qml")
             assert schema["required"] == ["qmlPath", "outputPath"]
-            assert set(schema["properties"]) == {"qmlPath", "outputPath", "width", "height", "dpr", "importPaths", "readyProperty", "timeoutMs", "imageMode", "initialProperties", "locale", "measureObjects", "dependencyPaths"}
+            assert set(schema["properties"]) == {"qmlPath", "outputPath", "width", "height", "dpr", "importPaths", "readyProperty", "timeoutMs", "imageMode", "initialProperties", "locale", "measureObjects", "dependencyPaths", "snapshot", "geometryChecks", "warningsPolicy"}
             passed("initialize, tools/list and advertised schema")
 
             preflight = client.request("tools/call", {"name": "healthcheck", "arguments": {}})
             assert preflight["result"]["isError"] is False, preflight
             assert preflight["result"]["structuredContent"]["qmlExecuted"] is False
-            assert preflight["result"]["structuredContent"]["toolVersion"] == "0.2.0"
+            assert preflight["result"]["structuredContent"]["toolVersion"] == "0.3.0"
             passed("healthcheck reports versions, backend and capabilities without project QML")
 
             for dpr in (1, 2):

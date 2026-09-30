@@ -1,6 +1,6 @@
 # QML Preview MCP
 
-Version 0.2.0. A local stdio MCP tool that renders reviewed Qt Quick QML fixtures
+Version 0.3.0. A local stdio MCP tool that renders reviewed Qt Quick QML fixtures
 to PNG using Qt's offscreen platform and software backend. Python handles MCP;
 a sibling C++ executable loads the QML and captures a completed frame.
 
@@ -21,11 +21,13 @@ make check
 The build uses `pkg-config --cflags --libs Qt6Quick`. Python has no package
 dependencies. `make check` starts an owned stdio client, renders the bundled
 component through its consumer fixture, validates PNG pixels, and checks failures.
-Its temporary outputs are removed on exit. To retain images and provenance:
+`make check` runs both legacy smoke and 0.3 geometry/protocol checks. Its temporary
+outputs are removed on exit. To retain images and provenance:
 
 ```sh
 mkdir -p evidence
 PYTHONDONTWRITEBYTECODE=1 python3 tests/smoke.py --evidence-dir evidence/run-1
+PYTHONDONTWRITEBYTECODE=1 python3 tests/v03.py --evidence-dir evidence/geometry-1
 ```
 
 The evidence directory must be new and its parent must already exist. Each run
@@ -52,6 +54,8 @@ cancellation stay responsive. There is no daemon or HTTP listener. Send
 requests receive no result. EOF or SIGTERM cancels owned work and exits. Render
 calls have their deadline plus two seconds of startup allowance. The server
 does not change file modes.
+Preflight and rendering share that subprocess time budget; post-capture hashing
+and exclusive publication perform bounded local file work afterward.
 
 For a separately authorized OpenCode setup, merge this entry into the existing
 `mcp` object, replacing the placeholder with the real path:
@@ -82,6 +86,8 @@ First call `healthcheck` with `{}`. It starts Qt offscreen without executing
 project QML, and reports renderer/tool/Python/Qt versions, import paths, renderer
 hash, supported root types/DPR and resource limits. It does not certify that a
 particular plugin's imports or assets load successfully.
+Every render also preflights the binary version before executing project QML.
+A mismatched wrapper/renderer is refused: rebuild with `make` before use.
 
 | Argument | Required/default | Meaning |
 | --- | --- | --- |
@@ -98,6 +104,9 @@ particular plugin's imports or assets load successfully.
 | `locale` | Environment | Explicit Qt locale such as `ru_RU`, `en_US`, or `C` |
 | `measureObjects` | `[]` | Up to 64 unique visual item `objectName` values to measure |
 | `dependencyPaths` | `[]` | Up to 128 explicit absolute files hashed before/after rendering |
+| `geometryChecks` | `[]` | Up to 64 explicit layout rules; default tolerance 1 logical unit |
+| `snapshot` | Omitted | `{}` enables bounded visual tree; maxDepth 0–16 (default 6), maxItems 1–256 (default 64) |
+| `warningsPolicy` | `report` | `error` rejects warning/critical/fatal diagnostics as acceptance failures |
 
 Unknown arguments, null top-level options, booleans in integer fields, fractional values,
 relative paths and `..` path segments are rejected. Paths are at most 4096
@@ -150,6 +159,62 @@ project catalog/theme/model data explicitly in the reviewed fixture.
 axis-aligned logical scene bounds, implicit size, visibility, enabled/clip and
 active-focus flags. They are snapshots, not a transition or compositor test.
 
+Named lookup traverses visual `childItems()`, not QObject ownership. It has a
+10,000-item work budget. `measureObjects` plus geometry rules may reference up
+to 128 distinct names. A detached object outside the consumer's visual tree is
+not measured; ambiguity or absence in explicit `measureObjects` is an error.
+
+### Geometry assertions
+
+`geometryChecks` automatically requests referenced items, using exact unique
+`objectName` values. Each rule accepts an optional `id` and `tolerance` (finite
+0–1000, default 1). Results include PASS/FAIL, expected/measured values and
+deviation. Hidden, nonpositive-area, missing or ambiguous targets fail a rule.
+
+| `kind` | Required fields | Meaning |
+| --- | --- | --- |
+| `align` | `a`, `b`, `field` | Match left, right, top, bottom, centerX or centerY |
+| `equal` | `a`, `b`, `field` | Match width or height |
+| `centered` | `a`, `container`, `axis` | Match container center on x or y |
+| `symmetric` | `a`, `b`, `container`, `axis` | Mirror the pair about the container's x/y center; cross-axis centers and both sizes must match |
+| `inside` | `a`, `container` | All bounds inside container, allowing tolerance |
+| `noOverlap` | `a`, `b` | Intersection penetration on at least one axis is no larger than tolerance |
+| `size` | `a`, `field`, `value` | Expected nonnegative width or height |
+| `gap` | `a`, `b`, `axis`, `value` | Directed distance from a's right/bottom to b's left/top; negative means overlap |
+
+Example rules (part of render arguments):
+
+```json
+{
+  "geometryChecks": [
+    {"id": "paired-actions", "kind": "symmetric", "a": "leftAction", "b": "rightAction", "container": "panel", "axis": "x", "tolerance": 1},
+    {"kind": "inside", "a": "content", "container": "panel"},
+    {"kind": "gap", "a": "heading", "b": "content", "axis": "y", "value": 16}
+  ]
+}
+```
+
+These are axis-aligned scene bounds, including transforms. They do not establish
+painted-pixel occlusion, ancestor clipping, rounded-shape intersection, text
+truncation or compositor position. Declare intended layout invariants; intentional
+overlap/asymmetry needs no universal rule. Geometry failure retains the verified
+PNG, explains the mismatch in geometryResults, sets acceptance FAIL and returns
+isError true. A geometry PASS is not design acceptance.
+
+### Visual-tree snapshot and warnings
+
+`snapshot: {}` returns nodes in visual preorder, with index/parent, depth, runtime
+class, objectName, bounded text and geometry. `truncated` is explicit when depth/
+node limits omit items; text truncation is also marked. The tree can contain
+hidden items and fixture data: review what is disclosed. It is not a QAccessible
+tree or an assistive-technology test. Indices are local to that render.
+
+Qt diagnosticRecords contain level, message, source, line and category.
+diagnostics preserves bounded JSON-lines text for older consumers. Unknown
+stderr lines are conservatively warnings. warningsPolicy error retains the
+verified PNG but makes acceptance FAIL on warnings or worse. Log truncation
+itself is a warning; strict mode cannot silently pass it.
+
 Without `readyProperty`, `readiness` is `loaded-frame`: the QML root exists and
 a frame has rendered. This does not prove asynchronous resources are ready.
 With the property, `readiness` is `property-and-frame`.
@@ -175,14 +240,15 @@ via a private temporary file and an exclusive hard link in the destination
 directory. A late collision also fails without replacing the original. The
 destination filesystem must support hard links. New PNGs have mode `0600`.
 
-Success returns `isError: false` and JSON text metadata containing:
+Render output returns JSON text metadata containing:
 
 - canonical QML/project import paths and effective Qt import paths;
 - logical width/height, verified pixel dimensions, actual DPR and output path;
 - `backend: software`, `platform: offscreen`, Qt/Python/tool versions;
 - locale, default font, capture timestamp, readiness mode/property;
 - PNG size/hash, root QML hash and bounded QML diagnostics;
-- renderer hash, initial properties, measured objects and explicit dependency hashes.
+- renderer hash, initial properties, measured objects and explicit dependency hashes;
+- geometryResults, acceptance/acceptanceErrors, typed diagnostics and optional snapshot.
 
 The root and `dependencyPaths` hashes are checked before and after rendering
 (at most 16 MiB per file). They do not automatically identify the whole
@@ -200,9 +266,25 @@ The active OpenCode model must declare image input in its `modalities.input`;
 `attachment: true` alone does not establish image support. A text-only model
 receives an unsupported-image message instead of visual evidence. Do not modify
 provider settings automatically; report the missing image-capable review route.
-MCP 2025-06-18 and 2025-11-25 additionally get the metadata in `structuredContent`;
-2024-11-05 gets JSON text only. An unsupported requested version receives
-2025-11-25, which the client must accept or disconnect.
+MCP 2025-06-18 and later additionally get metadata in structuredContent;
+2024-11-05 gets JSON text only.
+
+### Protocol eras
+
+Legacy clients initialize with 2024-11-05, 2025-06-18 or 2025-11-25, then send
+notifications/initialized. An unsupported legacy initialize version negotiates
+2025-11-25, which the client must accept or disconnect. Legacy ping is supported.
+
+Modern MCP 2026-07-28 clients call server/discover, tools/list or tools/call
+directly without a handshake. Every request carries
+`params._meta["io.modelcontextprotocol/protocolVersion"]: "2026-07-28"` and
+`params._meta["io.modelcontextprotocol/clientCapabilities"]: {}`. Optional
+io.modelcontextprotocol/clientInfo must contain valid name/version when present.
+Modern responses include resultType complete and serverInfo metadata. Discovery/
+lists are private and non-cacheable (ttlMs 0). Unsupported modern versions return
+-32022 with supported/requested versions. Ping and initialize are not modern
+methods. Both eras may interleave without changing each other's version.
+No extensions, resources, prompts or subscription streams are advertised.
 
 ### Errors
 
@@ -214,9 +296,13 @@ request. Initialize, send `notifications/initialized`, then list/call tools.
 
 QML load/import/root/readiness failures, missing renderer, invalid filesystem
 destinations, permissions, timeout, collisions and image verification failures
-return a tool result with `isError: true` and diagnostic text. They do not publish
-a candidate image. Nonfatal Qt/QML diagnostics are returned on success and need
-review; success does not certify that the QML has no binding warnings.
+return isError true with `error: {code, message, hint}` and publish no candidate
+image. Geometry and strict-warning failures occur after successful capture and
+deliberately retain the PNG. Review acceptanceErrors, geometryResults and
+diagnosticRecords. Clients may hide error-result attachments, so read the retained
+path explicitly. Modern argument-value validation is a tool error; malformed call
+structure/unknown tools remain JSON-RPC errors. Legacy argument errors preserve
+-32602. Metadata is bounded to 512 KiB, logs to 64 KiB, requests to 1 MiB.
 
 ## Safe consumer fixtures and limits
 
@@ -289,10 +375,13 @@ reading only. Native host/project design overrides web anti-slop defaults.
 ## Related tools and current gaps
 
 See [the pinned source comparison](docs/comparison.md) for qtPilot, qt-mcp,
-Playwright MCP, Chrome DevTools MCP and the official SDK. Version 0.2.0 has
-measurements rather than automatic geometry/symmetry assertions, no hosted CI,
-and no support for the newer MCP 2026-07-28 stateless protocol. The documented
-2025-11-25 and older negotiation remains the supported interface.
+Playwright MCP, Chrome DevTools MCP and the official SDK. The comparison records
+the historical 0.2.0 baseline. 0.3.0 adds explicit geometry assertions, a bounded
+visual tree, strict diagnostics, version pairing and modern protocol.
+
+The prepared CI workflow builds and runs make check and hooks on Ubuntu 22.04/
+24.04 with distro Qt packages and Node 22. Hosted PASS requires an authorized
+push and an observed run. CI does not run a production shell or install OpenCode.
 
 ## Source provenance and license
 

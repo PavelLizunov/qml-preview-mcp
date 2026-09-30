@@ -1,0 +1,38 @@
+name: Build and acceptance
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  offscreen:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      QT_QPA_PLATFORM: offscreen
+      QT_QUICK_BACKEND: software
+      LANG: C.UTF-8
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Install Qt build and fixture modules
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make pkg-config python3 qt6-base-dev qt6-declarative-dev qml6-module-qtquick qml6-module-qtqml qml6-module-qtqml-models qml6-module-qtqml-workerscript fonts-dejavu-core
+      - name: Record runtime versions
+        run: |
+          python3 --version
+          node --version
+          pkg-config --modversion Qt6Quick
+      - name: Build and test real offscreen consumers and MCP
+        run: make check
+      - name: Check OpenCode reminder hooks
+        run: node tests/hooks.mjs
