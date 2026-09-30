@@ -11,6 +11,7 @@
 #include <QMetaProperty>
 #include <QQmlEngine>
 #include <QQuickItem>
+#include <QQuickItemGrabResult>
 #include <QQuickView>
 #include <QMutex>
 #include <QMutexLocker>
@@ -18,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 
 static constexpr auto version = "0.3.0";
 static constexpr int metadataLimit = 512 * 1024;
@@ -285,14 +287,12 @@ int main(int argc, char **argv) {
             view.update();
         }
     });
-    QObject::connect(&view, &QQuickWindow::frameSwapped, &app, [&]() {
-        if (!armed || capturing)
-            return;
+    auto finishCapture = [&](const QImage &image) {
         if (!ready()) {
             armed = false;
+            capturing = false;
             return;
         }
-        capturing = true;
         QJsonObject measurements;
         const auto requested = config.value("measureObjects").toArray();
         QList<QQuickItem *> descendants;
@@ -325,11 +325,11 @@ int main(int argc, char **argv) {
             }
             measurements.insert(name, measured);
         }
-        // The queued callback runs on the GUI thread after a completed frame.
-        const QImage image = view.grabWindow();
         if (image.isNull() || image.size() != QSize(width * dpr, height * dpr)
             || view.effectiveDevicePixelRatio() != dpr) {
-            fail("Empty image or unsupported physical geometry/DPR");
+            fail(QString("Empty image or unsupported physical geometry/DPR: got %1x%2 at DPR %3, requested %4x%5 at DPR %6")
+                 .arg(image.width()).arg(image.height()).arg(view.effectiveDevicePixelRatio())
+                 .arg(width * dpr).arg(height * dpr).arg(dpr));
             return;
         }
         QFile output;
@@ -349,6 +349,7 @@ int main(int argc, char **argv) {
             {"dpr", view.effectiveDevicePixelRatio()}, {"backend", "software"},
             {"platform", QGuiApplication::platformName()}, {"qtVersion", qVersion()},
             {"rendererVersion", version}, {"measurements", measurements},
+            {"captureMethod", "QQuickItem::grabToImage"},
             {"qtImportPaths", QJsonArray::fromStringList(view.engine()->importPathList())},
             {"locale", QLocale().name()}, {"fontFamily", app.font().family()},
             {"fontPointSize", app.font().pointSizeF()},
@@ -364,6 +365,37 @@ int main(int argc, char **argv) {
         }
         jsonOutput(metadata);
         app.quit();
+    };
+    QSharedPointer<QQuickItemGrabResult> grabResult;
+    std::function<void(const QSize &)> grab;
+    grab = [&](const QSize &target) {
+        grabResult = view.rootObject()->grabToImage(target);
+        if (!grabResult) {
+            fail("Failed to initiate QQuickItem offscreen image capture");
+            return;
+        }
+        QObject::connect(grabResult.data(), &QQuickItemGrabResult::ready, &app, [&, target]() {
+            const QImage image = grabResult->image();
+            // Qt releases differ in whether targetSize is multiplied by DPR.
+            // If necessary, redraw once into a physical target, never resize pixels.
+            if (dpr == 2 && target == QSize(width, height) && image.size() == target) {
+                QTimer::singleShot(0, &app, [&]() { grab(QSize(width * dpr, height * dpr)); });
+                return;
+            }
+            finishCapture(image);
+        });
+    };
+    QObject::connect(&view, &QQuickWindow::frameSwapped, &app, [&]() {
+        if (!armed || capturing)
+            return;
+        if (!ready()) {
+            armed = false;
+            return;
+        }
+        capturing = true;
+        // Native layer redraw, not raster resizing. Qt 6.2's software backing
+        // store grabWindow does not reliably preserve DPR on offscreen QPA.
+        grab(QSize(width, height));
     }, Qt::QueuedConnection);
     QObject::connect(&view, &QQuickWindow::sceneGraphError, &app,
                      [&](QQuickWindow::SceneGraphError, const QString &message) { fail(message); });

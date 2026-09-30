@@ -222,8 +222,10 @@ a frame has rendered. This does not prove asynchronous resources are ready.
 With the property, `readiness` is `property-and-frame`.
 
 DPR changes rendering density while preserving logical geometry. A 480×300
-fixture at DPR 2 must produce 960×600 pixels. The image is drawn at that density,
-not resized from a lower-resolution PNG. Qt encodes the PNG, then decodes it to
+fixture at DPR 2 must produce 960×600 pixels. QQuickItem::grabToImage redraws the
+consumer subtree into an explicit physical-size offscreen target; no existing
+PNG is resized. This avoids older Qt software backing-store DPR limitations.
+The consumer subtree, not separate popup windows, is captured. Qt encodes the PNG, then decodes it to
 verify dimensions; Python checks its PNG header against the request and metadata.
 Empty images, wrong DPR/geometry and PNGs over 64 MiB are errors.
 
