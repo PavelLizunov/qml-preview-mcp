@@ -110,11 +110,16 @@ must follow the user's actual scope, not an invented blanket prohibition.
 A consent string is an admission assertion, not proof of human consent; the
 caller must obtain it first. The new native hidden-capture binary is
 installed and loaded in the current managed shell after the user explicitly
-waived task-owned ChatGPT draft preservation. Software/OpenGL DPR1 and software
-DPR2 hidden synthetic Chromium pixels and retention checks pass. The first real
+waived task-owned ChatGPT draft preservation. Software DPR1 and DPR2 hidden
+synthetic Chromium pixels and retention checks pass. A nominal OpenGL test
+can fall back to software and does not establish hardware-backend coverage. The first real
 hidden production attempt returned CONSUMER_UNAVAILABLE despite a loaded page;
-its native window may be detached on hide. That path is unresolved, not a hidden
-production PASS. Capture never opens/creates a page. Fresh MCP clients accept the hidden
+its native window may be detached on hide. A checked windowless fix is now
+installed; a subsequent user-requested capture of the existing hidden primary
+succeeded and actual ChatGPT pixels were inspected. No popup opening or input.
+This proves hidden image capture, not interactions or page-settled behavior.
+Windowless DPR falls back to the primary screen.
+Capture never opens/creates a page. Fresh MCP clients accept the hidden
 method; an already running MCP retains its previous validator until a safe client
 reload. See browser-capture.md for exact evidence and boundaries.
 
@@ -366,7 +371,11 @@ Omarchy plugin screen.
 
 `Window`, `ApplicationWindow`, Quickshell shell/panel roots and host-specific
 services require a reviewed project adapter presenting a `QQuickItem` consumer.
-The renderer does not start Quickshell or provide host services. Software Qt
+The default renderer does not start Quickshell or provide host services. An
+optional reviewed static-module adapter can load actual Quickshell QML interfaces
+without running its launcher, IPC server or connecting to the compositor. See
+[the adapter build](docs/quickshell-adapter.md). This is still an offscreen content
+consumer, not a layer-shell compositor test. Software Qt
 cannot verify ShaderEffect, custom GPU rendering or other unsupported visual
 features; they can be omitted by Qt without a fatal load error. Read Qt's
 [software adaptation limits](https://doc.qt.io/qt-6/qtquick-visualcanvas-adaptations-software.html).

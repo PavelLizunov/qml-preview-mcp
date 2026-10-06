@@ -24,8 +24,35 @@ new candidate. Source capture_plugin_page keeps its closed consent/schema and
 path-only privacy, but additionally validates QQuickRenderControl::offscreen.
 The current MCP catalog advertises the new method. First real hidden production
 capture returned CONSUMER_UNAVAILABLE despite HIDDEN/SUCCEEDED primary1; the view
-appears detached from its native window on hide. Windowless native capture remains
-unresolved. No PNG or production hidden PASS is claimed.
+appears detached from its native window on hide. The windowless fix now accepts
+this same explicit primary with a null window, restores its detached parent and
+uses primary-screen DPR as an explicit fallback. No production hidden PNG/PASS
+was claimed at deployment while STOPPED. Subsequent user-requested live capture
+succeeded with existing HIDDEN/SUCCEEDED primary, host721040, at20:20:02Z.
+Actual ChatGPT home/composer PNG inspected; after capture still HIDDEN/SUCCEEDED
+primary1. No opening/navigation/input/restart. Evidence local-captures/
+hidden-windowless-20261006-01.provenance.json. This establishes hidden image
+capture only, not physical focus, menus, draft retention or page-settled behavior. Windowless backend selection
+uses only renderer metadata of an existing focus window, never its pixels/items.
+The nominal --rhi test can fall back to software adaptation; do not infer actual
+hardware/OpenGL coverage merely from that CLI flag.
+
+Windowless final checks: fresh pixels/profile/renderer/draft/focus preservation
+and software DPR2 PASS; disable/resize cancellation PASS. Installed module only,
+backup windowless-capture-498gk53a, managed host721040. Binary SHA256
+cf50dcfbc4e2c3861c24330ac53ec06b150afed9a2207baa14c6e26bfbe97f49 matches
+mapped inode, peer UID/PID and no-consent ADMISSION_DENIED verified. Service's
+auxiliary-independence fix and capture opt-in unchanged. Source/build/IPC evidence
+is not real-page acceptance; no popup opened/input sent to manufacture it.
+Evidence ~/.local/share/qml-windowless-fix-zieaznto/windowless-deployment.json.
+
+The optional tests/hidden_capture.py needs the separately reviewed plugin fixture
+at ~/Work/omarchy-plugins/omarchy-chatgpt-lite/tests/hidden-capture.qml and native
+components. It reports this missing dependency instead of implying that the MCP
+repository alone provides it. Build with --inert-test and run --windowless,
+--dpr2 and --negative disable/resize against that isolated module. Endpoint and
+peer checks prevent contacting the production bridge. Do not broaden the native
+or wrapper production source allowlist to make a relocated fixture pass.
 
 Qt item grab requires a visible effective window. The hidden branch instead
 creates one non-platform QQuickWindow with QQuickRenderControl and a bounded

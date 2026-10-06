@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cmath>
+#include <QScreen>
 #include "hidden-browser-render.hpp"
 
 class BrowserCapture : public QObject {
@@ -164,16 +165,19 @@ private:
             // reviewed fixture), not Browser.qml; admission belongs to the
             // fixed Capture.qml owner and its explicit primary-view pointer.
             if (!webEngine || view->objectName() != "chatgptBrowser") { reject(socket, "CONSUMER_UNAVAILABLE"); return; }
-            if (!view->window()) { reject(socket, "CONSUMER_UNAVAILABLE"); return; }
-            const bool hidden = !presented && !view->window()->isVisible();
-            if (!hidden && (!presented || !view->isVisible() || !view->window()->isVisible())) { reject(socket, "HIDDEN_UNSUPPORTED"); return; }
+            const bool hidden = !presented && (!view->window() || !view->window()->isVisible());
+            if (!hidden && (!presented || !view->isVisible() || !view->window() || !view->window()->isVisible())) { reject(socket, "HIDDEN_UNSUPPORTED"); return; }
             if (view->property("loadState").toString() != "SUCCEEDED" || view->property("loading").toBool()) { reject(socket, "PAGE_NOT_READY"); return; }
             const bool fixture = view->property("fixtureMode").toBool();
             // Classify without exporting URLs. Do not inspect login, DOM or storage.
             if (!fixture && view->property("url").toUrl().host() != "chatgpt.com") { reject(socket, "PAGE_NOT_ALLOWLISTED"); return; }
             const auto before = hashes();
             if (before.isEmpty()) { reject(socket, "SOURCE_IDENTITY_UNAVAILABLE"); return; }
-            const double dpr = view->window()->effectiveDevicePixelRatio();
+            // Quickshell can detach warm content from its native window on hide.
+            // Record primary-screen DPR as fallback explicitly, not loaded-window proof.
+            const bool windowless = !view->window();
+            const double dpr = view->window() ? view->window()->effectiveDevicePixelRatio()
+                : (QGuiApplication::primaryScreen() ? QGuiApplication::primaryScreen()->devicePixelRatio() : 1.0);
             const QSize logical(qRound(view->width()), qRound(view->height()));
             const QSize pixels(qRound(logical.width() * dpr), qRound(logical.height() * dpr));
             if (!std::isfinite(dpr) || dpr <= 0 || dpr > 4 || logical.isEmpty() || pixels.width() > 8192 || pixels.height() > 8192
@@ -187,15 +191,15 @@ private:
                 auto *render = new HiddenBrowserRender(view, logical, dpr, this);
                 hiddenJob = render;
                 connect(socket, &QLocalSocket::disconnected, render, [render]() { render->cancel(); });
-                render->start([this, peer, target, before, dpr, logical, pixels, fixture](QImage image, QString code) {
+                render->start([this, peer, target, before, dpr, logical, pixels, fixture, windowless](QImage image, QString code) {
                     busy = false;
                     hiddenJob.clear();
                     if (!peer || peer->state() != QLocalSocket::ConnectedState) return;
                     if (!code.isEmpty()) { reject(peer, code); return; }
-                    if (!enabled() || !target || target != item || presented || !target->window()
-                        || target->window()->isVisible() || hashes() != before
+                    if (!enabled() || !target || target != item || presented
+                        || (windowless ? target->window() != nullptr : !target->window() || target->window()->isVisible()) || hashes() != before
                         || target->property("loading").toBool() || target->property("loadState").toString() != "SUCCEEDED"
-                        || target->window()->effectiveDevicePixelRatio() != dpr
+                        || (target->window() && target->window()->effectiveDevicePixelRatio() != dpr)
                         || qRound(target->width()) != logical.width() || qRound(target->height()) != logical.height()) {
                         reject(peer, "CONSUMER_CHANGED"); return;
                     }

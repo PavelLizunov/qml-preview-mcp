@@ -21,6 +21,10 @@
 #include <cstdlib>
 #include <functional>
 
+#ifdef QML_PREVIEW_QUICKSHELL
+#include "quickshell-adapter.hpp"
+#endif
+
 static constexpr auto version = "0.3.0";
 static constexpr int metadataLimit = 512 * 1024;
 
@@ -145,13 +149,19 @@ int main(int argc, char **argv) {
         QGuiApplication app(qtArgc, argv);
         QQmlEngine engine;
         auto paths = engine.importPathList();
+#ifdef QML_PREVIEW_QUICKSHELL
+        const bool quickshellModules = true;
+#else
+        const bool quickshellModules = false;
+#endif
         paths.removeAll(QCoreApplication::applicationDirPath());
         jsonOutput({{"rendererVersion", version}, {"qtVersion", qVersion()},
                     {"platform", QGuiApplication::platformName()}, {"backend", "software"},
                     {"qtImportPaths", QJsonArray::fromStringList(paths)},
                     {"rootTypes", QJsonArray {"QQuickItem", "Item", "Rectangle"}},
                     {"supportedDpr", QJsonArray {1, 2}}, {"interaction", false},
-                    {"qmlExecuted", false}, {"shaderEffects", false}});
+                    {"qmlExecuted", false}, {"shaderEffects", false},
+                    {"quickshellModules", quickshellModules}});
         return 0;
     }
     if (argc != 3 || QByteArray(argv[1]) != "--output-fd") {
@@ -228,7 +238,13 @@ int main(int argc, char **argv) {
     // Do not let renderer command-line flags reach Qt's platform selection.
     int qtArgc = 1;
     QGuiApplication app(qtArgc, argv);
+#ifdef QML_PREVIEW_QUICKSHELL
+    initializeQuickshellPreview();
+    auto *generation = createQuickshellPreview(qmlPath, imports);
+    QQuickView view(generation->engine, nullptr);
+#else
     QQuickView view;
+#endif
     QStringList importList = view.engine()->importPathList();
     importList.removeAll(QCoreApplication::applicationDirPath());
     view.engine()->setImportPathList(importList);
@@ -255,6 +271,10 @@ int main(int argc, char **argv) {
         qCritical("A local QQuickItem root is required; Window/ApplicationWindow/Quickshell roots need an adapter");
         return 1;
     }
+#ifdef QML_PREVIEW_QUICKSHELL
+    generation->root = view.rootObject();
+    generation->onReload(nullptr);
+#endif
     const auto initial = config.value("initialProperties").toObject();
     for (auto it = initial.constBegin(); it != initial.constEnd(); ++it) {
         const int index = view.rootObject()->metaObject()->indexOfProperty(it.key().toUtf8().constData());
@@ -350,6 +370,9 @@ int main(int argc, char **argv) {
             {"platform", QGuiApplication::platformName()}, {"qtVersion", qVersion()},
             {"rendererVersion", version}, {"measurements", measurements},
             {"captureMethod", "QQuickItem::grabToImage"},
+#ifdef QML_PREVIEW_QUICKSHELL
+            {"hostAdapter", "Quickshell static modules; offscreen, no compositor or shell IPC"},
+#endif
             {"qtImportPaths", QJsonArray::fromStringList(view.engine()->importPathList())},
             {"locale", QLocale().name()}, {"fontFamily", app.font().family()},
             {"fontPointSize", app.font().pointSizeF()},
@@ -401,5 +424,10 @@ int main(int argc, char **argv) {
                      [&](QQuickWindow::SceneGraphError, const QString &message) { fail(message); });
     readiness.start();
     view.show(); // QT_QPA_PLATFORM is forced to offscreen before app construction.
-    return app.exec();
+    const int result = app.exec();
+#ifdef QML_PREVIEW_QUICKSHELL
+    // Let the host's generation own its root/engine cleanup before view teardown.
+    generation->shutdown();
+#endif
+    return result;
 }

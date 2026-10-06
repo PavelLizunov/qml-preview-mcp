@@ -26,7 +26,10 @@ public:
         window->contentItem()->setVisible(true);
         window->contentItem()->setSize(QSizeF(size));
         const QSize pixels(qRound(size.width() * scale), qRound(size.height() * scale));
-        software = originalWindow->rendererInterface()->graphicsApi() == QSGRendererInterface::Software;
+        auto *backendWindow = originalWindow.data();
+        if (!backendWindow) backendWindow = qobject_cast<QQuickWindow *>(QGuiApplication::focusWindow());
+        // Backend metadata only; never read another window's items or pixels.
+        software = backendWindow && backendWindow->rendererInterface()->graphicsApi() == QSGRendererInterface::Software;
         if (qgetenv("QT_QUICK_BACKEND") == "software") software = true;
         if (software) {
             image = QImage(pixels, QImage::Format_ARGB32_Premultiplied);
@@ -102,7 +105,7 @@ private:
         deleteLater();
     }
     void frame() {
-        if (!target || !originalParent || !originalWindow || originalWindow->isVisible()
+        if (!target || !originalParent || (originalWindow && originalWindow->isVisible())
             || QGuiApplication::focusWindow() != originalFocus || window->isVisible()
             || window->handle() || target->property("renderProcessPid") != rendererPid
             || target->property("loading").toBool()

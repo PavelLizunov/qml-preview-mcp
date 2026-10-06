@@ -22,13 +22,16 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--imports', type=Path, required=True)
 parser.add_argument('--evidence', type=Path, required=True)
 parser.add_argument('--dpr', type=int, choices=(1, 2), default=1)
-parser.add_argument('--rhi', action='store_true', help='Offscreen OpenGL native render path')
+parser.add_argument('--rhi', action='store_true', help='Request OpenGL; Qt adaptation may still use software')
 parser.add_argument('--negative', choices=('disable','resize'))
+parser.add_argument('--windowless', action='store_true')
 args = parser.parse_args()
 args.evidence.mkdir(mode=0o700)
 endpoint = Path(f'/run/user/{os.getuid()}/qml-preview-slovn.chatgpt-lite-hidden-test/capture.sock')
 assert not endpoint.exists(), 'Refuse a preexisting test endpoint'
-fixture = Path('/home/slovn/Work/omarchy-plugins/omarchy-chatgpt-lite/tests/hidden-capture.qml')
+fixture = Path.home() / 'Work/omarchy-plugins/omarchy-chatgpt-lite/tests/hidden-capture.qml'
+if not fixture.is_file():
+    parser.error('Reviewed plugin hidden-capture.qml fixture required; see docs/browser-capture.md')
 env = dict(os.environ, QT_QPA_PLATFORM='offscreen', QT_QUICK_BACKEND='software', QT_SCALE_FACTOR=str(args.dpr))
 if args.rhi:
     env.pop('QT_QUICK_BACKEND', None)
@@ -36,9 +39,12 @@ if args.rhi:
 log = args.evidence / 'test.log'
 with log.open('w') as stream:
     # Separate copied inert fixture selects only fixed negative behavior, never a production QML path.
-    if args.negative:
-        copy = args.evidence/'tst_negative.qml'
-        copy.write_text(fixture.read_text().replace('import "../native" as Candidate', 'import "'+(fixture.parent.parent/'native').as_uri()+'" as Candidate').replace('property string failureMode: ""','property string failureMode: "'+args.negative+'"'))
+    if args.negative or args.windowless:
+        copy = args.evidence/'tst_selected.qml'
+        selected = fixture.read_text().replace('import "../native" as Candidate', 'import "'+(fixture.parent.parent/'native').as_uri()+'" as Candidate')
+        if args.negative: selected = selected.replace('property string failureMode: ""','property string failureMode: "'+args.negative+'"')
+        if args.windowless: selected = selected.replace('property bool windowlessCapture: false','property bool windowlessCapture: true')
+        copy.write_text(selected)
         fixture = copy
     process = subprocess.Popen(['/usr/lib/qt6/bin/qmltestrunner', '-import', str(args.imports), '-input', str(fixture)], env=env, stdout=stream, stderr=subprocess.STDOUT)
     try:
