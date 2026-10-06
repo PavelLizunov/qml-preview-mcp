@@ -78,10 +78,51 @@ For a separately authorized OpenCode setup, merge this entry into the existing
 
 OpenCode loads configuration at startup; a new session is needed after a config
 change. Building this project does not install it or modify any client config.
-The server advertises `healthcheck` and `render_qml`; a client may namespace tools differently.
+The server advertises `healthcheck`, `render_qml` and `capture_plugin_page`; a client may namespace tools differently.
 Discover its actual name and schema rather than assuming a harness-specific name.
 The client timeout must exceed the selected render deadline and startup allowance;
 the example uses 15 seconds to cover the maximum 10-second render deadline.
+
+## Fixture versus current browser content
+
+`render_qml` remains a reviewed, isolated QML fixture renderer. Its metadata now
+explicitly reports `captureKind: reviewed-qml-fixture` and
+`browserPageCoverage: not-established`. Loading actual Service/Content/Browser
+QML with `fixtureHtml` does **not** show the real ChatGPT interface.
+
+The separate opt-in `capture_plugin_page` tool captures the existing primary
+QtWebEngine item of `slovn.chatgpt-lite`, via a fixed local bridge. The new bridge
+supports visible capture and bounded hidden offscreen capture of that same item.
+It never navigates, opens a hidden popup, copies a profile, evaluates scripts,
+reads DOM/storage, controls inputs or captures desktop/other windows. Hidden
+capture briefly changes visual parenting only, restores it on completion/cancel,
+and refuses loading/frozen pages or focus/geometry/consumer changes. It renders
+at most ten frames on demand; no continuous hidden renderer or second browser. A direct
+human request to save a local image of this specific current page authorizes
+that capture without a second confirmation. Implementation/review alone does
+not authorize account capture; the required consent assertion names either the
+direct request or explicit consent. Browser/profile restarts are not capture
+operations. Outputs are local files outside Git, mode 0600; the tool returns a
+path rather than automatically attaching the image. The requesting assistant
+may inspect that PNG through the host image reader when the user authorizes
+visual review, including account content. Sharing with other models/services
+must follow the user's actual scope, not an invented blanket prohibition.
+A consent string is an admission assertion, not proof of human consent; the
+caller must obtain it first. The new native hidden-capture binary is
+installed and loaded in the current managed shell after the user explicitly
+waived task-owned ChatGPT draft preservation. Software/OpenGL DPR1 and software
+DPR2 hidden synthetic Chromium pixels and retention checks pass. The first real
+hidden production attempt returned CONSUMER_UNAVAILABLE despite a loaded page;
+its native window may be detached on hide. That path is unresolved, not a hidden
+production PASS. Capture never opens/creates a page. Fresh MCP clients accept the hidden
+method; an already running MCP retains its previous validator until a safe client
+reload. See browser-capture.md for exact evidence and boundaries.
+
+See [browser capture](docs/browser-capture.md) for native build/integration,
+closed tool schema, trust boundary, evidence and exact limitations. Existing
+healthcheck does not certify bridge availability. New tools are discoverable by
+fresh stdio clients; an already loaded client catalog may still advertise only
+the original two tools.
 
 ## `render_qml` contract
 

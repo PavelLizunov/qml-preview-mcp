@@ -17,6 +17,198 @@ import sys
 import tempfile
 import threading
 import time
+import socket
+import stat
+
+CAPTURE_PLUGIN_ID = "slovn.chatgpt-lite"
+CAPTURE_CONSENT = "I explicitly consent to a local image of the current account-capable page"
+CAPTURE_REQUEST_CONSENT = "The user explicitly requested this local current-page capture"
+CAPTURE_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "required": ["pluginId", "outputPath", "consent"],
+    "properties": {
+        "pluginId": {"type": "string", "const": CAPTURE_PLUGIN_ID},
+        "outputPath": {"type": "string", "minLength": 1, "maxLength": 4096,
+                       "description": "New local PNG outside every Git worktree; returns a path for user-authorized image inspection."},
+        "consent": {"type": "string", "enum": [CAPTURE_REQUEST_CONSENT, CAPTURE_CONSENT],
+                    "description": "A direct human request to save a local image of this specific current page authorizes that capture; do not ask twice. Assert the request only when it actually exists. Implementation/review requests alone do not authorize account capture. This capture assertion does not itself authorize browser restart or onward sharing; follow the user's image-review scope."},
+        "timeoutMs": {"type": "integer", "minimum": 100, "maximum": 5000, "default": 5000},
+    },
+}
+CAPTURE_DESCRIPTION = ("Capture only the existing primary QtWebEngine item of slovn.chatgpt-lite, visible or hidden, "
+               "through its opt-in local bridge. A direct human request for this specific local current-page image "
+               "is sufficient consent; no second confirmation. Implementation/review alone does not authorize capture. "
+               "Returns a local PNG path. The requesting assistant may inspect it when the user authorizes image review; onward sharing follows the user's scope. "
+               "Hidden capture renders the same item offscreen without showing a window or taking focus/input. "
+               "Refuses unavailable/loading/frozen pages; no opening, navigation, DOM, scripts, profile or desktop access. "
+               "A capture is not page-settled, interaction or live-site verification.")
+
+
+def validate_capture(args, invalid):
+    if not isinstance(args, dict) or set(args) - CAPTURE_SCHEMA["properties"].keys():
+        raise invalid("Capture accepts only pluginId, outputPath, consent and timeoutMs")
+    if args.get("pluginId") != CAPTURE_PLUGIN_ID:
+        raise invalid("Only slovn.chatgpt-lite primary-browser capture is admitted")
+    if args.get("consent") not in (CAPTURE_REQUEST_CONSENT, CAPTURE_CONSENT):
+        raise invalid("A direct human request for this local current-page image or explicit account-image consent is required")
+    path = args.get("outputPath")
+    if not isinstance(path, str) or not 1 <= len(path) <= 4096 or "\0" in path:
+        raise invalid("Invalid outputPath")
+    try:
+        path.encode("utf-8")
+    except UnicodeError as exc:
+        raise invalid("Invalid outputPath Unicode") from exc
+    if not Path(path).is_absolute() or ".." in Path(path).parts or Path(path).suffix.lower() != ".png":
+        raise invalid("outputPath must be an absolute new PNG without '..'")
+    timeout = args.get("timeoutMs", 5000)
+    if type(timeout) is not int or not 100 <= timeout <= 5000:
+        raise invalid("timeoutMs must be an integer from 100 to 5000")
+    return {**args, "timeoutMs": timeout}
+
+
+def outside_git(parent):
+    """Walk pinned descriptors to reject Git trees, including linked worktrees."""
+    fd = os.dup(parent)
+    try:
+        for _ in range(256):
+            try:
+                os.stat(".git", dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError("Account-capable capture outputs must be outside Git")
+            current = os.fstat(fd)
+            up = os.open("..", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            ancestor = os.fstat(up)
+            if (current.st_dev, current.st_ino) == (ancestor.st_dev, ancestor.st_ino):
+                os.close(up)
+                return
+            os.close(fd)
+            fd = up
+        raise ValueError("Output ancestor depth exceeds safety bound")
+    finally:
+        os.close(fd)
+
+
+def endpoint():
+    return Path(f"/run/user/{os.getuid()}/qml-preview-{CAPTURE_PLUGIN_ID}/capture.sock")
+
+
+def receive(peer, count, deadline, cancelled):
+    data = bytearray()
+    while len(data) < count:
+        if cancelled.is_set():
+            raise Cancelled("Capture cancelled")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Capture bridge exceeded its deadline")
+        peer.settimeout(min(remaining, 0.05))
+        try:
+            block = peer.recv(min(65536, count - len(data)))
+        except socket.timeout:
+            continue
+        if not block:
+            raise RuntimeError("Capture bridge closed an incomplete response")
+        data.extend(block)
+    return bytes(data)
+
+
+def capture_page(args, cancelled, publication_lock, api):
+    failure = api.ToolFailure
+    parent, name = api.destination(args["outputPath"])
+    try:
+        outside_git(parent)
+        if cancelled.is_set():
+            raise api.Cancelled("Capture cancelled before connection")
+        address = endpoint()
+        try:
+            for directory in (address.parent.parent, address.parent):
+                info = directory.lstat()
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                    raise failure("BRIDGE_UNSAFE", "Capture bridge directory is not private", "Do not connect to an untrusted endpoint")
+            info = address.lstat()
+            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                raise failure("BRIDGE_UNSAFE", "Capture endpoint is not an owned private socket", "Do not connect to an untrusted endpoint")
+        except FileNotFoundError as exc:
+            raise failure("BRIDGE_UNAVAILABLE", "The opt-in bridge is not loaded in the current plugin service",
+                          "Do not restart a warm browser with unknown drafts; existing view and loaded bridge required") from exc
+        deadline = time.monotonic() + args["timeoutMs"] / 1000
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.settimeout(args["timeoutMs"] / 1000)
+            peer.connect(str(address))
+            pid, uid, _ = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if uid != os.getuid():
+                raise failure("BRIDGE_UNSAFE", "Capture peer UID mismatch", "Refuse the endpoint")
+            peer.sendall(json.dumps({"operation": "capture", "pluginId": CAPTURE_PLUGIN_ID,
+                                     "consent": "local-account-image"}, separators=(",", ":")).encode() + b"\n")
+            meta_size, png_size = struct.unpack(">II", receive(peer, 8, deadline, cancelled))
+            if not 2 <= meta_size <= 65536 or png_size > api.MAX_PNG:
+                raise RuntimeError("Capture bridge response exceeds bounded sizes")
+            metadata = json.loads(receive(peer, meta_size, deadline, cancelled))
+            if not isinstance(metadata, dict):
+                raise RuntimeError("Invalid capture metadata")
+            if "error" in metadata:
+                code = metadata["error"].get("code") if isinstance(metadata["error"], dict) else None
+                allowed = {"TIMEOUT", "BAD_REQUEST", "ADMISSION_DENIED", "BUSY", "CONSUMER_UNAVAILABLE", "HIDDEN_UNSUPPORTED",
+                           "PAGE_NOT_READY", "PAGE_NOT_ALLOWLISTED", "SOURCE_IDENTITY_UNAVAILABLE", "GEOMETRY_UNSUPPORTED",
+                           "GRAB_UNSUPPORTED", "OFFSCREEN_UNSUPPORTED", "CONSUMER_CHANGED", "PIXELS_UNSUPPORTED", "PNG_FAILED"}
+                if code not in allowed or png_size:
+                    raise RuntimeError("Invalid bridge failure response")
+                raise failure(code, "Plugin capture refused: " + code,
+                              "Do not open, navigate or recreate the production page to hide this limitation")
+            data = receive(peer, png_size, deadline, cancelled)
+        # Only fixed, non-page-data fields are returned; never reflect arbitrary
+        # bridge metadata into the model-facing MCP response.
+        required = {"pluginId", "target", "captureKind", "pageKind", "captureMethod", "width", "height", "pixelWidth",
+                    "pixelHeight", "dpr", "capturedAt", "readiness", "pageSettled", "consumerPid", "qtVersion",
+                    "sourceHashes", "interactionVerified", "liveSiteVerified"}
+        if set(metadata) != required or metadata["pluginId"] != CAPTURE_PLUGIN_ID or metadata["target"] != "primary-browser" \
+                or metadata["captureKind"] != "current-browser-item" or metadata["captureMethod"] not in ("QQuickItem::grabToImage", "QQuickRenderControl::offscreen") \
+                or metadata["consumerPid"] != pid or metadata["pageSettled"] is not None \
+                or metadata["interactionVerified"] is not False or metadata["liveSiteVerified"] is not False \
+                or metadata["pageKind"] not in ("inert-local-fixture", "account-capable-live-page") \
+                or metadata["readiness"] != "navigation-succeeded-and-item-grab; page-settled-unknown":
+            raise RuntimeError("Capture identity/provenance mismatch")
+        for key in ("width", "height", "pixelWidth", "pixelHeight"):
+            if type(metadata[key]) is not int or not 1 <= metadata[key] <= 8192:
+                raise RuntimeError("Invalid capture geometry")
+        dpr = metadata["dpr"]
+        if type(dpr) not in (float, int) or not math.isfinite(dpr) or not 0 < dpr <= 4 \
+                or metadata["pixelWidth"] * metadata["pixelHeight"] > 16_000_000 \
+                or any(abs(metadata[p] - metadata[l] * dpr) > 0.5 for p, l in (("pixelWidth", "width"), ("pixelHeight", "height"))):
+            raise RuntimeError("Invalid capture DPR")
+        if not isinstance(metadata["capturedAt"], str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", metadata["capturedAt"]) \
+                or not isinstance(metadata["qtVersion"], str) or not re.fullmatch(r"\d+\.\d+\.\d+", metadata["qtVersion"]):
+            raise RuntimeError("Invalid capture timestamp/version")
+        hashes = metadata["sourceHashes"]
+        roots = [Path.home() / "Work/omarchy-plugins/omarchy-chatgpt-lite/native",
+                 Path.home() / ".config/omarchy/plugins/slovn.chatgpt-lite/native"]
+        names = ("Service.qml", "Content.qml", "Browser.qml", "Theme.js", "Capture.qml")
+        if not isinstance(hashes, dict) or not any(set(hashes) == {str(root / n) for n in names} for root in roots):
+            raise RuntimeError("Capture source allowlist mismatch")
+        for path, digest in hashes.items():
+            source = Path(path)
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or source.is_symlink() \
+                    or str(source.resolve(strict=True)) != path or api.file_hash(path) != digest:
+                raise RuntimeError("Capture source changed or hash mismatch")
+        if len(data) < 33 or data[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" \
+                or struct.unpack(">II", data[16:24]) != (metadata["pixelWidth"], metadata["pixelHeight"]):
+            raise RuntimeError("Capture PNG identity/geometry mismatch")
+        metadata.update({"outputPath": args["outputPath"], "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
+                         "imageMode": "path", "privacy": "local-file; user-scoped image review and sharing", "peerUid": uid,
+                         "toolVersion": api.VERSION, "imageInspected": False, "geometryVerified": "dimensions-only",
+                         "sourceHashScope": "current on-disk allowlisted files; loaded warm-QML revision not attested",
+                         "wrapperSha256": api.file_hash(Path(__file__).resolve()),
+                         "dependencyLimitations": "bridge binary, host imports, GPU and loaded QML cache not fully identified"})
+        with publication_lock:
+            if cancelled.is_set():
+                raise api.Cancelled("Capture cancelled before publication")
+            outside_git(parent)
+            api.publish(data, parent, name)
+        return metadata, None
+    finally:
+        os.close(parent)
+
 
 VERSION = "0.3.0"
 PROTOCOLS = ("2024-11-05", "2025-06-18", "2025-11-25")
@@ -425,6 +617,7 @@ def render(args, cancelled, publication_lock):
         if args["imageMode"] == "image" and len(data) > MAX_IMAGE:
             raise ValueError("PNG exceeds 4 MiB attachment limit; use imageMode='path' and the host image-reading tool")
         metadata.update({
+            "captureKind": "reviewed-qml-fixture", "browserPageCoverage": "not-established",
             "outputPath": args["outputPath"], "qmlPath": args["qmlPath"],
             "importPaths": args["importPaths"], "width": args["width"], "height": args["height"],
             "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
@@ -522,7 +715,12 @@ class Server:
         try:
             if cancelled.is_set():
                 raise Cancelled("Call cancelled before execution")
-            metadata, image = healthcheck(cancelled) if name == "healthcheck" else render(args, cancelled, self.lock)
+            if name == "healthcheck":
+                metadata, image = healthcheck(cancelled)
+            elif name == "capture_plugin_page":
+                metadata, image = capture_page(args, cancelled, self.lock, sys.modules[__name__])
+            else:
+                metadata, image = render(args, cancelled, self.lock)
             result = {"content": [{"type": "text", "text": json.dumps(metadata)}], "isError": metadata.get("acceptance") == "FAIL"}
             if image is not None:
                 result["content"].append({"type": "image", "mimeType": "image/png",
@@ -623,14 +821,16 @@ class Server:
                     {"name": "healthcheck", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
                      "description": "Preflight the offscreen Qt renderer, versions, imports and limits without executing project QML."},
                     {"name": "render_qml", "inputSchema": SCHEMA,
-                      "description": "Render the reviewed actual QML consumer after each meaningful plugin UI change and before delivery. Returns a PNG attachment by default plus geometry, hashes and diagnostics. Inspect the image, perform native design/anti-slop review, fix and rerender. NOT a sandbox; use inert models and explicit imports."}]}
+                      "description": "Render a reviewed QML fixture with inert models, not the current production browser page. QtWebEngine fixtureHtml is synthetic, not live-site coverage. Returns PNG, geometry, hashes and diagnostics; inspect the image. NOT a sandbox; use explicit imports."},
+                    {"name": "capture_plugin_page", "inputSchema": CAPTURE_SCHEMA,
+                     "description": CAPTURE_DESCRIPTION}]}
                 if protocol == MODERN_PROTOCOL:
                     result.update({"ttlMs": 0, "cacheScope": "private"})
             elif method == "tools/call":
                 if set(params) - {"name", "arguments"}:
                     raise InvalidParams("tools/call accepts only name, arguments and _meta")
                 name = params.get("name")
-                if name not in ("render_qml", "healthcheck"):
+                if name not in ("render_qml", "healthcheck", "capture_plugin_page"):
                     raise InvalidParams("Unknown tool")
                 args = params.get("arguments", {})
                 if protocol == MODERN_PROTOCOL and not isinstance(args, dict):
@@ -640,7 +840,7 @@ class Server:
                         raise InvalidParams("healthcheck takes no arguments")
                 else:
                     try:
-                        args = validate(args)
+                        args = validate_capture(args, InvalidParams) if name == "capture_plugin_page" else validate(args)
                     except InvalidParams as exc:
                         if protocol != MODERN_PROTOCOL:
                             raise

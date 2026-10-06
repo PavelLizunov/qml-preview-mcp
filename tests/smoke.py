@@ -177,7 +177,7 @@ def main():
 
         try:
             listing = client.request("tools/list")["result"]["tools"]
-            assert {tool["name"] for tool in listing} == {"healthcheck", "render_qml"}
+            assert {tool["name"] for tool in listing} == {"healthcheck", "render_qml", "capture_plugin_page"}
             schema = next(tool["inputSchema"] for tool in listing if tool["name"] == "render_qml")
             assert schema["required"] == ["qmlPath", "outputPath"]
             assert set(schema["properties"]) == {"qmlPath", "outputPath", "width", "height", "dpr", "importPaths", "readyProperty", "timeoutMs", "imageMode", "initialProperties", "locale", "measureObjects", "dependencyPaths", "snapshot", "geometryChecks", "warningsPolicy"}
